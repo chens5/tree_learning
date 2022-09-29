@@ -1,7 +1,9 @@
+from doctest import OPTIONFLAGS_BY_NAME
 import numpy as np
 import networkx as nx
 import time
 import torch
+import torchvision
 import torch.nn.functional as F
 import torch.nn as nn
 import ot
@@ -24,100 +26,91 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import accuracy_score
 import sys
 from scipy.stats import mode
+import argparse
 
-def document_classification(dataset):
-    wv_fname = '/data/sam/' + dataset+ '/vectors.npy'
-    word_vecs = np.load(wv_fname)
-    print("Number of words in BBC dataset", len(word_vecs)) 
-    document_fname = '/data/sam/' + dataset + '/distributions.npy'
-    documents = np.load(document_fname)
-    lbl_fname = '/data/sam/' + dataset + '/labels.npy'
-    labels = np.load(lbl_fname)
-    print("Generating distance matrix.....")
-    D = generate_distance_metric(word_vecs)
-    distance_mat_name = '/data/sam/' + dataset + '/distance_matrix.npy'
-    np.save(distance_mat_name, D)
-    #D = np.load("/data/sam/bbc/distance_matrix.npy")
+# A describes distributions i.e. A[0] is a probability distribution over all N words
+# Same with B
+# returns the tree Wasserstein distances 
+def batch_calc_twd(parents, weights, subtree, A, B):
+    vA = subtree @ A
+    vB = subtree @ B 
+    w_v = weights[parents] - weights
+    return 0.5  * w_v @ np.abs(vA - vB)
+import itertools
 
-    X_train, X_test, y_train, y_test = train_test_split(np.arange(0, len(documents)), labels, test_size=0.30, random_state=12)
-    x = []
-    y = []
-    d = []
+def make_subtree(parents, leaves):
+    subtree = np.zeros((len(parents), len(leaves)))
+    subtree[leaves, leaves] = 1
+    iterations = 0
+    for leaf in tqdm(leaves):
+        cur_node = parents[leaf]
+        while cur_node != -1:
+            subtree[cur_node][leaf] = 1
+            cur_node = parents[cur_node]
+            iterations += 1
 
-    save_idx = '/data/sam/' + dataset+ '/train_idx.npy'
-    np.save(save_idx, X_train)
-    train_distributions = documents[X_train]
-    print("Generating dataset......")
-    pool = mp.Pool(processes=10)
-    jobs = []
-    for i in trange(len(train_distributions)):
-        for j in range(i + 1, len(train_distributions)):
-            d1 = train_distributions[i]
-            d2 = train_distributions[j]
-            combined_vec = d1 + d2
-            non_zero_indices = np.nonzero(combined_vec)[0]
-            small_D = D[non_zero_indices][:, non_zero_indices]
-            x.append(i)
-            y.append(j)
-            job = pool.apply_async(ot.emd2, args=(d1[non_zero_indices], d2[non_zero_indices], small_D))
-            jobs.append(job)
-            #d.append(ot.emd2(d1, d2, D))
-    pool.close()
-    for job in tqdm(jobs):
-        job.wait()
-    d = [job.get() for job in jobs]
-    dataset = DistanceDataset(torch.tensor(x), torch.tensor(y),  d)
-    dataloader = DataLoader(dataset, batch_size=int(len(d)), shuffle=True)
-    print("Beginning to construct tree..........")
-    tree = OptimizedTree(D)
-    print("Starting training............")
-    plt_name = dataset + '_losses_50epochs'
-    tree.train(dataloader, train_distributions, max_iterations=50, plt_name=plt_name, save_epoch=False)
-    save_file = "/data/sam/" + dataset + "/results"
-    tree.save_tree_data(save_file, "t1")
-    return tree
+    return subtree
 
-def average_error(parents, leaves, M_idx, parameters, dataset):
-    # lst_names = ["_parents.npy", "_leaves.npy", "_parameters.npy", "_Midx.npy"]
-    # data = []
-    # for name in lst_names:
-    #     f_name = results_path + name
-    #     data.append(np.load(f_name))
-    word_vecs = np.load('/data/sam/' + dataset + '/vectors.npy')
-    word_vecs.astype(np.float32)
-    documents = np.load('/data/sam/'+ dataset + '/distributions.npy')
-    D = np.load("/data/sam/" + dataset + '/distance_matrix.npy')
+def average_error(parents, parameters, subtree, word_vecs, documents, distance_mat, normalize=False):
+    D = None
+    if normalize == True:
+        D = distance_mat/distance_mat.max()
+        word_vecs = word_vecs/D.max()
+    else:
+        D = distance_mat
 
-    # Get test dataset
-    train_indices = np.load("/data/sam/bbc/train_idx.npy")
-    test_indices = []
-    for i in range(len(documents)):
-        if i not in train_indices:
-            test_indices.append(i)
-
-    test_documents = documents[test_indices]
+    test_documents = documents
     # format test documents
     formatted_test_docs = []
     for distribution in tqdm(test_documents):
         formatted_test_docs.append(format_distributions(distribution))
     print("Number of test documents:", len(formatted_test_docs))
 
-    opt_solver = te.TreeEstimators()
-    opt_solver.load_tree(parents.astype(np.int32), leaves.astype(np.int32))
-
     qt_solver = ote.OTEstimators()
     qt_solver.load_vocabulary(word_vecs)
 
-    opt = np.zeros((len(test_documents), len(test_documents)))
+    opt_tree = np.zeros((len(test_documents), len(test_documents)))
     ft = np.zeros((len(test_documents), len(test_documents)))
     qt = np.zeros((len(test_documents), len(test_documents)))
     ot_d = np.zeros((len(test_documents), len(test_documents)))
     
-    opt_time = []
     ft_time = []
     qt_time = []
-    sinkhorn_time = []
 
+    print("Computing optimized tree wasserstein distances")
+    combos = itertools.combinations(np.arange(len(test_documents)), 2)
+    l = list(combos)
+    indices = [list(t) for t in zip(*l)]
+    A = test_documents[indices[0]].transpose()
+    B = test_documents[indices[1]].transpose()
+    print(".... beginning batch computations ....")
+    start = time.time()
+    batches_numbers = len(indices[0])//200
+    batch_results = []
+    for i in trange(batches_numbers):
+        if i == batches_numbers-1:
+            a = A[:, i * 200: ]
+            b = B[:, i * 200: ]
+            approx = batch_calc_twd(parents, parameters, subtree, a, b)
+            batch_results.append(approx)
+        else:
+            a = A[:, i*200: (i + 1)*200]
+            b = A[:, i*200: (i + 1)*200]
+            approx= batch_calc_twd(parents, parameters, subtree, a, b)
+            batch_results.append(approx)
+    #opt_tree_results = batch_calc_twd(parents, parameters, subtree, A, B)
+    end = time.time()
+    opt_tree_time = end - start
+    opt_tree_results = np.concatenate(batch_results)
+    print(opt_tree_results)
+    count = 0
+    for i in trange(len(test_documents)):
+        for j in range(i + 1, len(test_documents)):
+            opt_tree[i][j] = opt_tree_results[count]
+            opt_tree[j][i] = opt_tree_results[count]
+            count += 1
+
+    print("Computing optimal transport distances")
     pool = mp.Pool(processes=20)
     jobs = []
     for i in trange(len(test_documents)):
@@ -129,8 +122,6 @@ def average_error(parents, leaves, M_idx, parameters, dataset):
             small_D = D[non_zero_indices][:, non_zero_indices]
             job = pool.apply_async(ot.emd2, args=(d1[non_zero_indices], d2[non_zero_indices], small_D))
             jobs.append(job)
-            # ot_d[i][j] = ot.emd2(documents[i], documents[j], D)
-            # ot_d[j][i] = ot_d[i][j]
     
     for job in tqdm(jobs):
         job.wait()
@@ -142,15 +133,11 @@ def average_error(parents, leaves, M_idx, parameters, dataset):
             ot_d[i][j] = result
             ot_d[j][i] = result
             count += 1
-    
+
+    print("Starting flowtree and quadtree computations")
     for i in trange(len(test_documents)):
         for j in range(i + 1, len(test_documents)):
-            start = time.time()
-            opt[i][j] = tree_wasserstein(M_idx, parameters, opt_solver, formatted_test_docs[i], formatted_test_docs[j])
-            opt[j][i] = opt[i][j]
-            end = time.time()
-            opt_time.append(end - start)
-            
+
             start = time.time()
             ft[i][j] = qt_solver.flowtree_query(formatted_test_docs[i], formatted_test_docs[j])
             ft[j][i] = ft[i][j]
@@ -163,70 +150,127 @@ def average_error(parents, leaves, M_idx, parameters, dataset):
             qt[j][i] = qt[i][j]
             end = time.time()
             qt_time.append(end - start)
-            
-            # ot_d[i][j] = ot.emd2(documents[i], documents[j], D)
-            # ot_d[j][i] = ot_d[i][j]
-    
-    approximations = [opt, ft, qt]
-    approx_times = [opt_time, ft_time, qt_time]
-    approx_names = ["OptimizedTree", "Flowtree", "Quadtree"]
-    for i in range(3):
-        print(approx_names[i], "Average relative error:", np.mean(np.abs(approximations[i] - ot_d)), 
+
+    approximations = [ ft, qt]
+    approx_times = [ft_time, qt_time]
+    approx_names = ["Flowtree", "Quadtree"]
+    #print("sinkhorn:", np.mean(sinkhorn_time))
+    print("Optimal tree mean absolute error", np.mean(np.abs(opt_tree - ot_d)), "std. dev.:", np.std(np.abs(opt_tree - ot_d)))
+    print("------ Average time per document:", opt_tree_time/len(indices[0]))
+    for i in range(2):
+        print(approx_names[i], "Mean absolute error:", np.mean(np.abs(approximations[i] - ot_d)), 
               "std dev.:", np.std(np.abs(approximations[i])))
         print("------- Average time per document:", np.mean(approx_times[i]), "std dev:", np.std(approx_times[i]))
-    return ot_d, approximations
+    return ot_d, ft, qt, opt_tree
 
-# takes approximation matrices where approx[i][j] = approx. distance between i and j
-# order: optimized tree, flowtree, quadtree
-def recall(approximations, real_distance, plt_name):
-    names = ["OptimizedTree", "FlowTree", "QuadTree"]
-    sorted_distances = np.argsort(real_distance, axis=1)
-    top1 = sorted_distances[:, 1]
-    all_recall = []
-    for approx in approximations:
-        approx_sort = np.argsort(approx, axis=1)
-        candidates = approx_sort[:, 1:]
-        recall = np.zeros(candidates.shape[1])
-        for i in range(candidates.shape[0]):
-            for j in range(candidates.shape[1]):
-                if top1[i] in candidates[i, :j]:
-                    recall[j] += 1  
-        all_recall.append(recall)  
-    for i in range(len(all_recall)):
-        recall= all_recall[i]
-        plt.plot(np.arange(0, len(recall)), recall, label=names[i])
-    plt.legend()
-    print("SAVED at", plt_name)
-    plt.savefig(plt_name)
-    return all_recall
+def svm(metric, labels, train_indices, t=1):
+    test_indices = []
+    for i in range(len(labels)):
+        if i not in train_indices:
+            test_indices.append(i)
+    D_train, D_test = metric[train_indices][:, train_indices], metric[test_indices][:, train_indices]
+    y_train, y_test = labels[train_indices], labels[test_indices]
+    
+    svc = SVC(kernel = 'precomputed')
+    
+    kernel_train = np.exp(-t * D_train)
+    
+    svc.fit(kernel_train, y_train)
+    
+    kernel_test = np.exp(-t * D_test)
+    
+    y_pred = svc.predict(kernel_test)
+    return accuracy_score(y_test, y_pred)
 
-def kNN_experiment(metrics, labels, k = 5):
-    for metric in tqdm(metrics):
-        metric_sort = np.argsort(metric, axis=1)
-        prediction_accuracy = 0
-        for i in range(metric_sort.shape[0]):
-            top_k = metric_sort[i, 1:k + 1]
-            predict = mode(labels[top_k])[0][0]
-            if predict == labels[i]:
-                prediction_accuracy += 1
-        print("Prediction accuracy:", prediction_accuracy)
+def mean_relative_error(original, approximation):
+    n = original.shape[0]
+    errors = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if original[i][j] > 0:
+                errors.append(abs(original[i][j] - approximation[i][j])/ original[i][j])
+                print(approximation[1])
+                h()
+    return np.mean(errors), np.std(errors) 
+
+def get_remaining_experiments():
+    parser = argparse.ArgumentParser(description="Mean relative error, SVM, and nearest neighbor")
+    parser.add_argument("--flowtree", type=str)
+    parser.add_argument("--quadtree", type=str)
+    parser.add_argument("--opttree", type=str)
+    parser.add_argument("--ot", type=str)
+    parser.add_argument("--SVM", type=bool, default=False)
+    parser.add_argument("--knn", type=int, default=0)
+
+    args = parser.parse_args()
+
+    flowtree = np.load(args.flowtree)
+    quadtree = np.load(args.quadtree)
+    opttree = np.load(args.opttree)
+    optimal_transport = np.load(args.ot)
+
+    approximations = [("optimized tree", opttree), ("flowtree", flowtree), ("quadtree", quadtree)]
+    for approximation in approximations:
+        avg, std = mean_relative_error(optimal_transport, approximation[1])
+        print("Approximation:", approximation[0], "--mean relative error:", avg, "standard deviation:", std)
+    
+    return 
+
+
+
+def get_approximations():
+    parser = argparse.ArgumentParser(description="Process training parameters")
+    parser.add_argument("--dataset_name", type=str, help="Dataset for training")
+    parser.add_argument("--trial", type=str, help="trial id")
+    parser.add_argument("--distributions", type=str, help="Word distributions")
+    parser.add_argument("--word_vectors", type=str, help="word vectors to use")
+    parser.add_argument("--labels", type=str, help="labels for distributions")
+    parser.add_argument("--train_indices", type=str, help="Saved training indices")
+    parser.add_argument("--normalized", type=bool, help="normalize dataset", default=False)
+
+    args = parser.parse_args()
+
+    model_name = '/data/sam/' + args.dataset_name + '/results/' + args.trial + '.pt'
+    model_info = torch.load(model_name, map_location='cpu')
+    # load model
+    parents = model_info['parents']
+    leaves = model_info['leaves']
+    try:
+        subtree = model_info['subtree'].numpy()
+    except KeyError:
+        subtree = make_subtree(parents, leaves)
+    weights = model_info['optimized_state_dict']['param'].numpy()
+    # Load data, i.e. distributions, word vectors, and labels 
+    print("Dataset:", args.dataset_name)
+    word_vecs = np.load(args.word_vectors)
+    print("Number of words in dataset", len(word_vecs)) 
+    documents =np.load(args.distributions)
+    print("Number of documents:", len(documents))
+    labels = np.load(args.labels)
+    #train_indices = np.load(args.train_indices)
+    print("Size of training dataset:", )
+    distance_mat = np.load("/data/sam/" + args.dataset_name + '/distance_matrix.npy')
+
+
+    ot_d, flowtree, quadtree, opttree = average_error(parents, weights, subtree, word_vecs, documents, distance_mat, normalize=args.normalized)
+
+    ot_name = '/data/sam/' + args.dataset_name +'/results/ot_approximations.npy'
+    np.save(ot_name, ot_d)
+    ft_name = '/data/sam/' + args.dataset_name + '/results/ft_approximations.npy'
+    np.save(ft_name, flowtree)
+    qt_name = '/data/sam/' + args.dataset_name + '/results/qt_approximations.npy'
+    np.save(qt_name, quadtree)
+    opttree_name = '/data/sam/' + args.dataset_name + '/results/' + str(args.trial) + 'approximations.npy'
+    np.save(opttree_name, opttree)
     
 
-def main():
-    # dataset = sys.argv[1]
-    # learned_tree = document_classification(dataset)
-    # parents = np.load("/data/sam/bbc/results/30/t1/t1_parents.npy")
-    # leaves = np.load("/data/sam/bbc/results/30/t1/t1_leaves.npy")
-    # parameters = np.load("/data/sam/bbc/results/30/t1/t1_parameters.npy")
-    # M_idx = np.load("/data/sam/bbc/results/30/t1/t1_Midx.npy")
-    # ot_d, approximations = average_error(parents, leaves, M_idx, parameters, "bbc")
-    ot_d =  np.load("/data/sam/bbc/results/30/approximations/OTDistance_t1_test.npy")
-    approximations = np.load("/data/sam/bbc/results/30/approximations/approximations_t1.npy")
-    #recall(approximations, ot_d, "bbc_recall_t1")
-    labels = np.load("/data/sam/bbc/labels.npy")
-    kNN_experiment([ot_d], labels, k=1)
-    
+def test_subtree():
+    parents = [4, 4, 5, 5, 6, 6, -1]
+    leaves = [0, 1, 2, 3]
+    print(make_subtree(parents, leaves))
 
 if __name__=="__main__":
-    main()
+    get_approximations()
+    #get_remaining_experiments()
+    #test_subtree()
 

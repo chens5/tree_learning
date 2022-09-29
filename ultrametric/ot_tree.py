@@ -22,17 +22,25 @@ from torch.utils.data import DataLoader
 from mst import scipy_mst, gpu_mst
 import pickle
 import dill
-
-def run_dill_encoded(payload):
-    fun, args = dill.loads(payload)
-    return fun(*args)
-
-def apply_async(pool, fun, args):
-    payload = dill.dumps((fun, args))
-    return pool.apply_async(run_dill_encoded, (payload,))
+from scipy.cluster.hierarchy import linkage
+from torch.utils.tensorboard import SummaryWriter
 
 
+def generate_distances(points):
+    D = np.zeros((len(points), len(points)))
+    pool = mp.Pool(processes=20)
+    jobs = []
+    for i in trange(len(points)):
+        for j in range(i + 1, len(points)):
+            job = pool.apply_async(distance.euclidean, args=(points[i], points[j]))
+            jobs.append(job)
+            
+    for job in tqdm(jobs):
+        job.wait()
+    results = [job.get() for job in jobs]
+    return results
 
+# Generate distance matrix for a set of points. 
 def generate_distance_metric(points):
     D = np.zeros((len(points), len(points)))
     pool = mp.Pool(processes=20)
@@ -54,6 +62,7 @@ def generate_distance_metric(points):
             count += 1
     return D
 
+# Distance dataset. 
 class DistanceDataset(Dataset):
     def __init__(self, idx, idy, d):
         self.x = idx
@@ -66,7 +75,10 @@ class DistanceDataset(Dataset):
     def __getitem__(self, id):
         return self.x[id], self.y[id], self.d[id]
 
-# use nn.Module
+# Optimizing ultrametric trees via the torch nn.Module superclass. 
+# Note that this tree can be saved by calling torch.save and saving
+# the state_dict of the model as well as the leaves and parents of the
+# tree. 
 class GPUOptimizedTree(nn.Module):
     def __init__(self, distance_matrix, device="cpu"):
         super(GPUOptimizedTree, self).__init__()
@@ -74,15 +86,17 @@ class GPUOptimizedTree(nn.Module):
         self.D = distance_matrix
         self.n = distance_matrix.shape[0]
         self.triu_indices = np.triu_indices(self.n, 1)
-        self.vec = self.D[self.triu_indices]
+        self.vec = self.D[self.triu_indices].astype(np.double)
         self.np_parameters = np.zeros((2*self.n - 1), dtype=np.double)
         self.leaves = np.arange(0, self.n, dtype=np.int32)
         self.parents = np.zeros((2*self.n - 1), dtype=np.int32)
         self.M_idx = np.zeros((self.n, self.n), dtype=np.int32)
+        # self.subtree object is a tensor of shape len(self.parents) x len(self.leaves)
+        # self.subtree[i][j] denotes whether leaf j is in the subtree of node i. 
         self.subtree = gpu_mst(self.vec, self.n, self.M_idx, self.np_parameters, self.leaves, self.parents)
         self.subtree = torch.tensor(self.subtree.astype(np.double), device = self.device)
-        #print(self.subtree)
         
+        # self.param[i] is the weight assigned to a specific parent. 
         self.param = nn.Parameter(torch.tensor(self.np_parameters, device = self.device), requires_grad=True)    
     
     
@@ -93,71 +107,98 @@ class GPUOptimizedTree(nn.Module):
         w_v = self.param[self.parents[:2*self.n - 2]] - self.param[:2*self.n - 2]
         return 0.5 * torch.matmul(w_v,torch.abs(m_d1 - m_d2))
 
-    # 0 for similar
-    # 1 for dis-similar
-    def calc_contrastive_loss(self, d1, d2, labels, m=1):
-        mask = labels != 0
-        
-        ds = (1/n_ds) * torch.sum(torch.min(self.wasserstein1(d1[mask], d2[mask]), m))
-        s = (1/n_s) * torch.sum(self.wasserstein1(d1[-mask], d2[-mask]))
-        return s - ds
-
     # compute wasserstein loss 
     def calc_wasserstein1_loss(self, d1, d2, ot_distances):
         
-        m_d1 = torch.matmul(self.subtree, d1)[:2 * self.n - 2]
-        m_d2 = torch.matmul(self.subtree, d2)[:2 * self.n - 2]
-        w_v = self.param[self.parents[:2*self.n - 2]] - self.param[:2*self.n - 2]
-        w1_tree = 0.5 * torch.matmul(w_v, torch.abs(m_d1- m_d2))
-        #print(m_d1 - m_d2)
+        m_d1 = torch.matmul(self.subtree, d1)
+        m_d2 = torch.matmul(self.subtree, d2) 
+        # self.param[self.parents] get weights of node parents
+        # self.param weight of node themselves
+        # thus w_v = weight of edge from a node (represented by the coordinate) to parent
+        w_v = self.param[self.parents] - self.param
+        w1_tree = 0.5 * torch.matmul(w_v, torch.abs(m_d1 - m_d2))
+        del m_d1
+        del m_d2
+        del w_v
         return torch.sum(torch.square(ot_distances - w1_tree))**0.5
 
+    # 1 = similar
+    # 0 = dis-similar
+    def calc_contrastive_loss(self, d1, d2, similarity_labels, m=1):
+        
+        sidx = torch.nonzero(similarity_labels, as_tuple=True)[0]
 
-    def train(self, dataloader, optimizer, train_distributions, max_iterations=5, plt_name="test_losses", save_epoch=False):        
+        m_d1 = torch.matmul(self.subtree, d1[:, sidx])[:2 * self.n - 2]
+        m_d2 = torch.matmul(self.subtree, d2[:, sidx])[:2 * self.n - 2]     
+        # self.param[self.parents[:2 * self.n - 2]] get weights of node parents
+        # self.param[:2 * self.n - 2] weight of node themselves
+        # thus w_v = weight of edge from a node (represented by the coordinate) to parent
+        w_v = self.param[self.parents[:2*self.n - 2]] - self.param[:2*self.n - 2]
+        sim_hinge = (1/len(sidx)) * torch.sum(0.5 * torch.matmul(w_v, torch.abs(m_d1 - m_d2)))
+        del m_d1
+        del m_d2
+
+        didx = (similarity_labels==0).nonzero(as_tuple=True)[0]
+        m_d1 = torch.matmul(self.subtree, d1[:, didx])[:2 * self.n - 2]
+        m_d2 = torch.matmul(self.subtree, d2[:, didx])[:2 * self.n - 2]
+        dis_hinge = (1/len(didx)) * torch.sum(F.relu(m-0.5 * torch.matmul(w_v, torch.abs(m_d1 - m_d2)) ))
+        del m_d1
+        del m_d2
+        return sim_hinge + dis_hinge
+
+    def train(self, dataloader, optimizer, train_distributions, max_iterations=5, plt_name="test_losses", save_epoch=False, contrastive=False):        
         losses = []        
         batch_losses = []
         num_batches = len(dataloader)
+        writer = SummaryWriter()
+        train_distributions = torch.tensor(train_distributions).to(self.device)
         for i in trange(max_iterations):
-            batch_loss = 0.0
+            loss = 0.0
+            optimizer.zero_grad()
             for batch in tqdm(dataloader):
-                optimizer.zero_grad()
-                b1_dist = torch.tensor(train_distributions[batch[0]])
-                b2_dist = torch.tensor(train_distributions[batch[1]])
-                b1 = torch.transpose(b1_dist, 0, 1).to(self.device)
-                b2 = torch.transpose(b2_dist, 0, 1).to(self.device)
+                b1_dist = train_distributions[batch[0]]
+                b2_dist = train_distributions[batch[1]]
+                # b1_dist = batch[0]
+                # b2_dist = batch[1]
+                b1 = torch.transpose(b1_dist, 0, 1)
+                b2 = torch.transpose(b2_dist, 0, 1)
                 ot_dist = batch[2].to(self.device)
-                start = time.time()
-                loss = self.calc_wasserstein1_loss(b1, b2, ot_dist)
-                end = time.time()
-                print("Time per batch:", end - start)
-                batch_loss += loss.item()
-                losses.append(loss.item())
+                if contrastive==False:
+                    loss = self.calc_wasserstein1_loss(b1, b2, ot_dist)
+                else:
+                    loss = self.calc_contrastive_loss(b1, b2, ot_dist)
                 loss.backward()
-                optimizer.step()
+                del b1 
+                del b2            
+            losses.append(loss.detach().cpu())
+            writer.add_scalar('Loss/train', loss.detach().cpu().item(), i)
+            
 
-                
-                self.np_parameters = self.param.detach().cpu().numpy().astype(np.double)
-                self.vec = self.np_parameters[self.M_idx[self.triu_indices]]
-                start =  time.time()
-                self.subtree = scipy_mst(self.vec, self.n, self.M_idx, self.np_parameters, 
-                                        self.leaves, self.parents)
-                end = time.time()
-                print("Time for MST:", end - start)
-                self.subtree = torch.tensor(self.subtree.astype(np.double), device = self.device)
-                #self.subtree.to(device)
-                with torch.no_grad():
-                    for j in range(2*self.n - 1):
-                        if j < self.n:
-                            self.param[j] = 0.0
-                            # self.parameters[j] = torch.min(self.np_parameters[M[j]])
-                        else:
-                            self.param[j] = self.np_parameters[j]
-                # print(self.np_parameters)
-                # print(self.parameters)
-            batch_losses.append(batch_loss/num_batches)
-            if len(batch_losses) >=10 and (abs(batch_losses[-1] - batch_losses[-2]) < 0.5):
-                print("Trained for", i, "epochs")
-                break
+            optimizer.step()
+
+            self.np_parameters = self.param.detach().cpu().numpy().astype(np.double)
+            self.vec = self.np_parameters[self.M_idx[self.triu_indices]]
+
+            self.subtree = gpu_mst(self.vec, self.n, self.M_idx, self.np_parameters, 
+                                    self.leaves, self.parents)
+            #self.mst()
+            self.subtree = torch.tensor(self.subtree.astype(np.double), device = self.device)
+
+
+            with torch.no_grad():
+                for j in range(2*self.n - 1):
+                    if j < self.n:
+                        self.param[j] = 0.0
+                        #self.parameters[j] = torch.min(self.np_parameters[self.M_idx[j]])
+                    elif self.param[j] < 0.0:
+                        self.param[j] = 0.0
+                    else:
+                        self.param[j] = self.np_parameters[j]
+           
+            # batch_losses.append(batch_loss/num_batches)
+            # if len(batch_losses) >=10 and (abs(batch_losses[-1] - batch_losses[-2]) < 0.5):
+            #     print("Trained for", i, "epochs")
+            #     break
         plt.plot(np.arange(0, len(losses)), losses)
         plt.savefig(plt_name)
 
@@ -210,7 +251,6 @@ class OptimizedTree:
             loss += (ot_distances[i] - tree_wasserstein(self.M_idx, self.parameters, self.solver, mu, rho))**2
         return loss**0.5
 
-
     def train(self, dataloader, distributions, max_iterations=5, plt_name="losses", save_epoch=False):
         # format distributions for tree solver
         mus_f = []
@@ -219,7 +259,6 @@ class OptimizedTree:
         mus_f=np.array(mus_f, dtype=object)
         # initial parameters
         optimizer = torch.optim.Adam([self.parameters], lr=0.1)
-        optimizer.to(device)
 
         losses = []
 
@@ -253,7 +292,7 @@ class OptimizedTree:
             if save_epoch:
                 per_epoch_name = "t4_e" + str(i)
                 self.save_tree_data("/data/sam/twitter/results/30", per_epoch_name)
-            if len(losses) >=300 and (abs(losses[-1] - losses[-2]) < 0.5 or losses[-1] > losses[-2]):
+            if len(losses) >=10 and (abs(losses[-1] - losses[-2]) < 1.0 or losses[-1] > losses[-2]):
                 print("Trained for", i, "epochs")
                 break
         plt.plot(np.arange(0, len(losses)), losses)
@@ -261,7 +300,7 @@ class OptimizedTree:
 
 
 class WeightOptimizedQuadtree:
-    def __init__(self, num_points):
+    def __init__(self, pointset):
         self.solver = ote.OTEstimators()
         self.solver.load_vocabulary(pointset)
         self.num_nodes = len(self.solver.return_parent_details())
@@ -283,6 +322,7 @@ class WeightOptimizedQuadtree:
     
     def train(self, dataloader,lr=0.01, max_iterations=5, plt_name="qt_losses", save_epoch=False):
         optimizer = torch.optim.Adam([self.parameters], lr=lr)
+        losses = []
         for i in trange(max_iterations):
             for batch in dataloader:
                 optimizer.zero_grad()
@@ -298,49 +338,19 @@ class WeightOptimizedQuadtree:
 
 # testing code
 def test_tree():
-    np.random.seed(1)
-    n_points = 100
-    pointset = generate_random_points(n_points)
+    pointset = np.array([[0, 0], [0, 1], [10, 0], [10, 1]])
     D = generate_distance_metric(pointset)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    tree = GPUOptimizedTree(D, device = "cpu")
+    print(tree.subtree)
+    print(tree.param)
+    A = np.array([[0.0, 0.25, 0.25, 0.50], [0.5, 0.5, 0.0, 0.0]])
+    B = np.array([[0.25, 0.5, 0.25, 0.0], [0.5, 0.25, 0.0, 0.25]])
+    ot.emd2(A[0], B[0], D)
+    ot.emd2(A[1], B[1], D)
+    d = torch.tensor([ot.emd2(A[0], B[0], D), ot.emd2(A[1], B[1], D)])
+    tree.calc_wasserstein1_loss(torch.transpose(torch.tensor(A), 0, 1), torch.transpose(torch.tensor(B), 0, 1), d)
+    return
     
-    tree = GPUOptimizedTree(D, device = device)
-    tree.to(device)
-    #D = np.array([[0, 1, 5, 3], [1, 0, 3, 5], [5, 3, 0, 1], [3, 5, 1, 0]], dtype=np.double)
-    d1_train = generate_random_dists(100, n_points)
-    d2_train = generate_random_dists(2, n_points)
-
-    x = []
-    y = []
-    d = []
-    for i in range(len(d1_train)):
-        for j in range(i + 1, len(d1_train)):
-            x.append(d1_train[i])
-            
-            y.append(d1_train[j])
-            
-            d.append(ot.emd2(d1_train[i], d1_train[j], D))
-
-    dataset = DistanceDataset(torch.tensor(x), torch.tensor(y), torch.tensor(d))
-    dataloader = DataLoader(dataset, batch_size=int(100*(100 - 1)*0.5))
-
-    optimizer = torch.optim.Adam(tree.parameters(), lr=0.1)
-    tree.train(dataloader, optimizer, max_iterations=50)
-
-    # x = []
-    # y = []
-    # d = []
-    # for i in range(len(d1_train)):
-    #     for j in range(i + 1, len(d1_train)):
-    #         x.append(i)
-            
-    #         y.append(j)
-    #         d.append(ot.emd2(d1_train[i], d1_train[j], D))
-    # dataset = DistanceDataset(torch.tensor(x), torch.tensor(y), d)
-    # dataloader = DataLoader(dataset, batch_size = 100)
-    # #D = np.array([[0, 1, 5, 3], [1, 0, 3, 5], [5, 3, 0, 1], [3, 5, 1, 0]], dtype=np.double)
-    # tree1 = OptimizedTree(D)
-    # tree1.train(dataloader, d1_train, max_iterations=50, plt_name="test_losses1")
 
 
 if __name__=="__main__":
