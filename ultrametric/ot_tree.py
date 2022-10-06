@@ -1,3 +1,4 @@
+import sched
 import numpy as np
 import networkx as nx
 import time
@@ -24,7 +25,7 @@ import pickle
 import dill
 from scipy.cluster.hierarchy import linkage
 from torch.utils.tensorboard import SummaryWriter
-
+from torch.optim.lr_scheduler import ExponentialLR
 
 def generate_distances(points):
     D = np.zeros((len(points), len(points)))
@@ -146,18 +147,73 @@ class GPUOptimizedTree(nn.Module):
         del m_d2
         return sim_hinge + dis_hinge
 
-    def train(self, dataloader, optimizer, train_distributions, max_iterations=5, plt_name="test_losses", save_epoch=False, contrastive=False):        
+
+    def train_weights(self, dataloader, optimizer, train_distributions, 
+                      max_iterations=5, plt_name="test_losses", save_epoch=False, filename='/data/sam/model.pt', bsz=-1, contrastive=False):        
         losses = []        
-        batch_losses = []
-        num_batches = len(dataloader)
         writer = SummaryWriter()
         train_distributions = torch.tensor(train_distributions).to(self.device)
+        optimizer.zero_grad()
+        scheduler = ExponentialLR(optimizer, gamma=0.9)
         for i in trange(max_iterations):
             loss = 0.0
-            optimizer.zero_grad()
-            for batch in tqdm(dataloader):
+            
+            total = 0
+            num_batches = 0
+            for batch in dataloader:
                 b1_dist = train_distributions[batch[0]]
                 b2_dist = train_distributions[batch[1]]
+                total += len(batch[0])
+                b1 = torch.transpose(b1_dist, 0, 1)
+                b2 = torch.transpose(b2_dist, 0, 1)
+                ot_dist = batch[2].to(self.device)
+                if contrastive==False:
+                    loss = self.calc_wasserstein1_loss(b1, b2, ot_dist)
+                else:
+                    loss = self.calc_contrastive_loss(b1, b2, ot_dist)
+                loss.backward()   
+                num_batches += 1     
+                if bsz > 0.0 and num_batches % bsz == 0:
+                    losses.append(loss.detach().cpu())
+                    writer.add_scalar('Loss/train', loss.detach().cpu().item(), i)
+                    
+                    #torch.nn.utils.clip_grad_norm_(self.param, 0.5)
+                    optimizer.step()
+
+                    F.relu(self.param)
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+            if save_epoch:
+                sf = filename + '_' + str(i) + '.pt'
+                torch.save({'parents': self.parents,
+                'leaves': self.leaves,
+                'subtree':self.subtree,
+                'vec': self.vec,
+                'M_idx': self.M_idx,
+                'np_parameters': self.np_parameters,
+                'optimized_state_dict': self.state_dict()}, 
+                sf)
+        plt.plot(np.arange(0, len(losses)), losses)
+        # plt.savefig(plt_name)
+
+    def train(self, dataloader, optimizer, train_distributions, 
+              max_iterations=5, plt_name="test_losses", save_epoch=False, filename='/data/sam/model.pt', bsz=-1, contrastive=False):        
+        losses = []        
+        logdir = 'runs/image' + filename
+        writer = SummaryWriter(log_dir=logdir)
+        train_distributions = torch.tensor(train_distributions).to(self.device)
+        scheduler = ExponentialLR(optimizer, gamma=0.9)
+        optimizer.zero_grad()
+        for i in trange(max_iterations):
+            loss = 0.0
+            
+            total = 0
+            num_batches = 0
+            for batch in dataloader:
+                b1_dist = train_distributions[batch[0]]
+                b2_dist = train_distributions[batch[1]]
+                total += len(batch[0])
                 # b1_dist = batch[0]
                 # b2_dist = batch[1]
                 b1 = torch.transpose(b1_dist, 0, 1)
@@ -167,34 +223,45 @@ class GPUOptimizedTree(nn.Module):
                     loss = self.calc_wasserstein1_loss(b1, b2, ot_dist)
                 else:
                     loss = self.calc_contrastive_loss(b1, b2, ot_dist)
-                loss.backward()
-                del b1 
-                del b2            
-            losses.append(loss.detach().cpu())
-            writer.add_scalar('Loss/train', loss.detach().cpu().item(), i)
+                loss.backward()   
+                num_batches += 1     
+                if bsz > 0.0 and num_batches % bsz == 0:
+                    losses.append(loss.detach().cpu())
+                    writer.add_scalar('Loss/train', loss.detach().cpu().item(), i)
+                    
+                    #torch.nn.utils.clip_grad_norm_(self.param, 0.5)
+                    optimizer.step()
+
+                    self.np_parameters = self.param.detach().cpu().numpy().astype(np.double)
+                    self.vec = self.np_parameters[self.M_idx[self.triu_indices]]
+
+                    self.subtree = gpu_mst(self.vec, self.n, self.M_idx, self.np_parameters, 
+                                            self.leaves, self.parents)
+                    #self.mst()
+                    self.subtree = torch.tensor(self.subtree.astype(np.double), device = self.device)
+
+                    with torch.no_grad():
+                        for j in range(2*self.n - 1):
+                            if j < self.n:
+                                self.param[j] = 0.0
+                                #self.parameters[j] = torch.min(self.np_parameters[self.M_idx[j]])
+                            elif self.param[j] < 0.0:
+                                self.param[j] = 0.0
+                            else:
+                                self.param[j] = self.np_parameters[j]
+                    optimizer.zero_grad()
+                    print(self.parents)
             
-
-            optimizer.step()
-
-            self.np_parameters = self.param.detach().cpu().numpy().astype(np.double)
-            self.vec = self.np_parameters[self.M_idx[self.triu_indices]]
-
-            self.subtree = gpu_mst(self.vec, self.n, self.M_idx, self.np_parameters, 
-                                    self.leaves, self.parents)
-            #self.mst()
-            self.subtree = torch.tensor(self.subtree.astype(np.double), device = self.device)
-
-
-            with torch.no_grad():
-                for j in range(2*self.n - 1):
-                    if j < self.n:
-                        self.param[j] = 0.0
-                        #self.parameters[j] = torch.min(self.np_parameters[self.M_idx[j]])
-                    elif self.param[j] < 0.0:
-                        self.param[j] = 0.0
-                    else:
-                        self.param[j] = self.np_parameters[j]
-           
+            if save_epoch:
+                sf = filename + '_' + str(i) + '.pt'
+                torch.save({'parents': self.parents,
+                'leaves': self.leaves,
+                'subtree':self.subtree,
+                'vec': self.vec,
+                'M_idx': self.M_idx,
+                'np_parameters': self.np_parameters,
+                'optimized_state_dict': self.state_dict()}, 
+                sf)
             # batch_losses.append(batch_loss/num_batches)
             # if len(batch_losses) >=10 and (abs(batch_losses[-1] - batch_losses[-2]) < 0.5):
             #     print("Trained for", i, "epochs")
