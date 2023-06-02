@@ -20,22 +20,12 @@ import ot_estimators as ote
 from utils import *
 import torch.multiprocessing as tmp
 import multiprocessing as mp
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
 from ot_tree import *
-from sklearn.model_selection import train_test_split
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.svm import SVC
+
 import sys
 from scipy.stats import mode
 import argparse
 import scipy.io
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.utils._testing import ignore_warnings
-from sklearn.exceptions import ConvergenceWarning
 
 
 
@@ -618,7 +608,6 @@ def get_approximations():
 
 
     ot_d, opttree = average_error_opt_tree(parents, weights, subtree, word_vecs, documents, distance_mat)
-    h()
 
     ot_name = '/data/sam/' + args.dataset_name +'/results/ot_gauss_approximations.npy'
     np.save(ot_name, ot_d)

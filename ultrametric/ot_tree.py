@@ -15,6 +15,7 @@ from utils import *
 import multiprocessing as mp
 from torch.utils.data import Dataset
 from mst import scipy_mst, gpu_mst
+from scipy.cluster.hierarchy import linkage
 
 def generate_distances(points):
     D = np.zeros((len(points), len(points)))
@@ -88,7 +89,51 @@ class UltrametricOptimizedTree(nn.Module):
         self.param = nn.Parameter(torch.tensor(self.np_parameters, device = self.device), requires_grad=True)    
         self.initial_tree = np.copy(self.parents)
     
-    
+
+    def compute_flow(self, d1, d2):
+        matching = np.zeros((self.n, self.n))
+        current = {}
+        leaf_queue = np.copy(self.leaves)
+        parents = np.copy(self.parents)
+        # Fill current with leaf node weights
+        
+
+        while not leaf_queue:
+            node_id = leaf_queue.pop()
+            parent = parents[node_id]
+            # subtract weights in node
+            d1weights, d2weights = current[node_id]
+            while d1weights and d2weights:
+                # tuple of leaf_node id and weight
+                id1 = d1weights[0][0]
+                weight1 = d1weights[0][1]
+
+                id2 = d1weights[0][0]
+                weight2 = d1weights[0][1]
+
+                matched_weight = min(weight1, weight2)
+                matching[id1, id2] = matched_weight
+
+                if weight1 - matched_weight == 0:
+                    d1weights.pop()
+                if weight2 - matched_weight == 0:
+                    d2weights.pop()
+
+            # push remaining weight and leaf identity up to next level
+            if d1weights:
+                current[parent][0].append(d1weights)
+            if d2weights:
+                current[parent][1].append(d2weights)
+            # remove node from parent list 
+            parents[node_id] = -1
+            # check if there is another node in the parent list which has its parent
+            is_inner = parent in parents
+            # if no, push node id into queue
+            if not is_inner:
+                leaf_queue.append(parent)
+
+        return matching
+
     # compute tree wasserstein distance 
     def wasserstein1(self, d1, d2):
         m_d1 = torch.matmul(self.subtree, d1)[:2 * self.n - 2]
@@ -166,7 +211,7 @@ class UltrametricOptimizedTree(nn.Module):
             end = time.time()
             time_p_epoch.append(end - start)
             if save_epoch:
-                sf = filename + '_' + str(i) + '.pt'
+                sf = filename + str(i) + '.pt'
                 torch.save({'parents': self.parents,
                 'leaves': self.leaves,
                 'subtree':self.subtree,

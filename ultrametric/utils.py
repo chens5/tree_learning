@@ -12,13 +12,26 @@ from networkx.drawing.nx_pydot import *
 from tqdm import trange
 import time
 
-def generate_random_dists(num_dists, n):
-    dists = np.random.random_sample((num_dists, n))
-    norms = np.linalg.norm(dists, ord=1, axis = 1)
+# returns: uniform distributions over the support points defined
+def generate_uniform_dists(num_dists, n, sparsity=1.0):
+    dists = np.zeros((num_dists, n))
+    for i in range(num_dists):
+        # choose up to sparsity% points
+        max_support = int(sparsity*n)
+        supp_sz = np.random.randint(1, max_support)
+        idx = np.random.choice(n, size=supp_sz, replace=False)
+        dists[i, idx] = 1.0
+    norms = np.linalg.norm(dists, ord=1, axis=1)
     dists = dists/norms[:, None]
     return dists
 
-def generate_gaussian_dists(num_dists, n):
+# returns: non-uniform distributions over the support points defined
+def generate_gaussian_dists(num_dists, n, sparsity=1.0):
+    dists = np.zeros((num_dists, n))
+    for i in range(num_dists):
+        max_support = int(sparsity*n)
+        supp_sz = np.random.randint(1, max_support)
+        idx = np.random.choice(n, size = supp_sz, replace=False)
     dists = np.random.normal(loc=0.0, scale=1.0, size=(num_dists, n))
     norms = np.linalg.norm(dists, ord=1, axis = 1)
     dists = dists/norms[:, None]
